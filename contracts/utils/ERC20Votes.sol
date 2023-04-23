@@ -1,0 +1,116 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "./ERC20Permit.sol";
+import "./IVotes.sol";
+
+abstract contract ERC20Votes is ERC20Permit {
+    struct Checkpoint {
+        uint32 fromBlock;
+        uint224 votes;
+    }
+
+    mapping(address => Checkpoint[]) private _checkpoints;
+    Checkpoint[] private _totalSupplyCheckpoints;
+
+    event DelegateChanged(address indexed delegator, address indexed fromDelegate, address indexed toDelegate);
+    event DelegateVotesChanged(address indexed delegate, uint256 previousVotes, uint256 newVotes);
+
+    function checkpoints(address account, uint32 pos) public view virtual returns (Checkpoint memory) {
+        return _checkpoints[account][pos];
+    }
+
+    function numCheckpoints(address account) public view virtual returns (uint32) {
+        return SafeCast.toUint32(_checkpoints[account].length);
+    }
+
+    function delegates(address account) public view virtual returns (address) {
+        return _delegates[account];
+    }
+
+    function getVotes(address account) public view virtual returns (uint256) {
+        uint256 pos = _checkpoints[account].length;
+        return pos == 0 ? 0 : _checkpoints[account][pos - 1].votes;
+    }
+
+    function getPastVotes(address account, uint256 blockNumber) public view virtual returns (uint256) {
+        require(blockNumber < block.number, "ERC20Votes: block not yet mined");
+        return _checkpoints[account].upperLookupRecent(SafeCast.toUint32(blockNumber));
+    }
+
+    function getPastTotalSupply(uint256 blockNumber) public view virtual returns (uint256) {
+        require(blockNumber < block.number, "ERC20Votes: block not yet mined");
+        return _totalSupplyCheckpoints.upperLookupRecent(SafeCast.toUint32(blockNumber));
+    }
+
+    function delegate(address delegatee) public virtual {
+        _delegate(_msgSender(), delegatee);
+    }
+
+    function delegateBySig(address delegatee, uint256 nonce, uint256 expiry, uint8 v, bytes32 r, bytes32 s) public virtual {
+        require(block.timestamp <= expiry, "ERC20Votes: signature expired");
+        address signer = ECDSA.recover(_hashTypedDataV4(keccak256(abi.encode(_DELEGATION_TYPEHASH, delegatee, nonce, expiry))), v, r, s);
+        _useNonce(signer);
+        _delegate(signer, delegatee);
+    }
+
+    function _delegate(address delegator, address delegatee) internal virtual {
+        address currentDelegate = delegates(delegator);
+        uint256 delegatorBalance = balanceOf(delegator);
+        _delegates[delegator] = delegatee;
+
+        emit DelegateChanged(delegator, currentDelegate, delegatee);
+
+        _moveVotingPower(currentDelegate, delegatee, delegatorBalance);
+    }
+
+    function _moveVotingPower(address src, address dst, uint256 amount) internal virtual {
+        if (src != dst && amount > 0) {
+            if (src != address(0)) {
+                (uint256 oldWeight, uint256 newWeight) = _writeCheckpoint(_checkpoints[src], _subtract, amount);
+                emit DelegateVotesChanged(src, oldWeight, newWeight);
+            }
+
+            if (dst != address(0)) {
+                (uint256 oldWeight, uint256 newWeight) = _writeCheckpoint(_checkpoints[dst], _add, amount);
+                emit DelegateVotesChanged(dst, oldWeight, newWeight);
+            }
+        }
+    }
+
+    function _writeCheckpoint(Checkpoint[] storage ckpts, function(uint256, uint256) view returns (uint256) op, uint256 delta) internal returns (uint256 oldWeight, uint256 newWeight) {
+        uint256 pos = ckpts.length;
+        oldWeight = pos == 0 ? 0 : ckpts[pos - 1].votes;
+        newWeight = op(oldWeight, delta);
+
+        if (pos > 0 && ckpts[pos - 1].fromBlock == SafeCast.toUint32(block.number)) {
+            ckpts[pos - 1].votes = SafeCast.toUint224(newWeight);
+        } else {
+            ckpts.push(Checkpoint({fromBlock: SafeCast.toUint32(block.number), votes: SafeCast.toUint224(newWeight)}));
+        }
+    }
+
+    function _add(uint256 a, uint256 b) private pure returns (uint256) {
+        return a + b;
+    }
+
+    function _subtract(uint256 a, uint256 b) private pure returns (uint256) {
+        return a - b;
+    }
+
+    function _afterTokenTransfer(address from, address to, uint256 amount) internal virtual override {
+        super._afterTokenTransfer(from, to, amount);
+
+        _moveVotingPower(delegates(from), delegates(to), amount);
+    }
+
+    function _mint(address to, uint256 amount) internal virtual override {
+        super._mint(to, amount);
+        _writeCheckpoint(_totalSupplyCheckpoints, _add, amount);
+    }
+
+    function _burn(address from, uint256 amount) internal virtual override {
+        super._burn(from, amount);
+        _writeCheckpoint(_totalSupplyCheckpoints, _subtract, amount);
+    }
+}
